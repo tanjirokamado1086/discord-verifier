@@ -6,10 +6,10 @@ const puppeteer = require('puppeteer');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const EMAIL       = process.env.EMAIL_USER;
+const EMAIL        = process.env.EMAIL_USER;
 const APP_PASSWORD = process.env.EMAIL_PASS;
-const CRON_SECRET = process.env.CRON_SECRET;
-const IMAP_HOST   = process.env.IMAP_HOST || 'imap.gmail.com';
+const CRON_SECRET  = process.env.CRON_SECRET;
+const IMAP_HOST    = process.env.IMAP_HOST || 'imap.gmail.com';
 
 // ─── Link extractor ────────────────────────────────────────────────────────
 
@@ -19,7 +19,7 @@ function extractVerifyLink(html, text) {
     const anchorRegex = /<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
     let match;
     while ((match = anchorRegex.exec(html)) !== null) {
-      const url      = match[1];
+      const url       = match[1];
       const innerText = match[2].replace(/<[^>]+>/g, '').trim().toLowerCase();
       if (
         url.includes('discord.com') &&
@@ -72,47 +72,38 @@ async function getVerifyLink() {
   }
 
   try {
-    // DEBUG: last 5 subjects
-    const all = await client.search({ all: true }, { uid: true });
-    if (!all?.length) {
-      console.log('Mailbox is empty.');
+    // Search only emails from last 10 minutes — avoids sorting entirely
+    // and guarantees we only act on a fresh verification email
+    const since = new Date(Date.now() - 10 * 60 * 1000);
+
+    let messages = await client.search({ from: '@discord.com', since }, { uid: true });
+    if (!messages?.length) {
+      messages = await client.search({ body: 'discord.com', since }, { uid: true });
+    }
+    if (!messages?.length) {
+      console.log('No recent Discord emails found (last 10 min).');
       return null;
     }
-    console.log(`Total messages: ${all.length}`);
-    for (const uid of all.slice(-5)) {
-      const m = await client.fetchOne(uid, { source: true }, { uid: true });
-      const p = await simpleParser(m.source);
-      console.log(` - ${p.subject} (${p.date?.toISOString()})`);
-    }
 
-    // Find Discord emails
-    let messages = await client.search({ from: '@discord.com' }, { uid: true });
-    if (!messages?.length) messages = await client.search({ body: 'discord.com' }, { uid: true });
-    if (!messages?.length) { console.log('No Discord emails found.'); return null; }
+    // With a 10-min window there will only ever be 1-2 emails max.
+    // UIDs within such a narrow window ARE in order, so just take the last one.
+    const latestId = messages[messages.length - 1];
+    console.log(`Found ${messages.length} recent Discord email(s). Using UID: ${latestId}`);
 
-    console.log(`Found ${messages.length} Discord emails. Sorting by date...`);
-
-    // Sort by actual date — UIDs in All Mail are NOT date-ordered
-    let latestUid = null, latestDate = null;
-    for await (const msg of client.fetch(messages, { envelope: true }, { uid: true })) {
-      const d = msg.envelope?.date ? new Date(msg.envelope.date) : null;
-      console.log(` - UID ${msg.uid}: ${msg.envelope?.subject} (${d?.toISOString()})`);
-      if (d && (!latestDate || d > latestDate)) { latestDate = d; latestUid = msg.uid; }
-    }
-
-    if (!latestUid) { console.log('Could not find latest email.'); return null; }
-    console.log(`Latest: UID ${latestUid} @ ${latestDate.toISOString()}`);
-
-    const msg = await client.fetchOne(latestUid, { source: true }, { uid: true });
+    const msg    = await client.fetchOne(latestId, { source: true }, { uid: true });
     const parsed = await simpleParser(msg.source);
-    console.log(`Subject: ${parsed.subject}`);
+    console.log(`Subject : ${parsed.subject}`);
+    console.log(`Received: ${parsed.date?.toISOString()}`);
 
-    if (parsed.subject?.includes('Verify Discord Login') || parsed.subject?.includes('Email Verification')) {
+    if (
+      parsed.subject?.includes('Verify Discord Login') ||
+      parsed.subject?.includes('Email Verification')
+    ) {
       const link = extractVerifyLink(parsed.html, parsed.text);
       if (link) return link;
       console.log('Could not extract link from email.');
     } else {
-      console.log('Latest Discord email is not a verification email.');
+      console.log('Email is not a login verification email — skipping.');
     }
 
     return null;
@@ -144,11 +135,16 @@ async function clickWithBrowser(url) {
       '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     );
 
-    console.log(`Navigating to verify link...`);
-    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
-    await new Promise(r => setTimeout(r, 3000)); // let JS settle
+    console.log('Navigating to verify link...');
 
-    const title = await page.title();
+    // domcontentloaded — don't wait for networkidle2 as Discord keeps
+    // background connections open and would always time out
+    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+
+    // Give JS a moment to complete the auth handshake
+    await new Promise(r => setTimeout(r, 3000));
+
+    const title    = await page.title();
     const finalUrl = page.url();
     console.log(`Final URL : ${finalUrl}`);
     console.log(`Page title: ${title}`);
@@ -171,20 +167,21 @@ app.get('/verify', async (req, res) => {
   try {
     const link = await getVerifyLink();
     if (!link) {
-      return res.status(200).json({ success: true, message: 'No verification link found' });
+      return res.status(200).json({ success: true, message: 'No recent verification email found' });
     }
 
     console.log(`Clicking: ${link}`);
     const result = await clickWithBrowser(link);
 
-    const verified = result.title.toLowerCase().includes('discord') &&
-                     !result.title.toLowerCase().includes('error');
+    const verified =
+      result.title.toLowerCase().includes('discord') &&
+      !result.title.toLowerCase().includes('error');
 
     if (verified) {
       console.log('✅ Login verified!');
       return res.status(200).json({ success: true, message: 'Login verified', ...result });
     } else {
-      console.log('⚠️ Clicked but unsure if verified. Check title/URL above.');
+      console.log('⚠️  Clicked but verification uncertain — check title/URL above.');
       return res.status(200).json({ success: false, message: 'Clicked but verification uncertain', ...result });
     }
   } catch (err) {
