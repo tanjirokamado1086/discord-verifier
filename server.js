@@ -145,7 +145,7 @@ async function clickWithBrowser(url) {
     );
 
     console.log(`Navigating to verify link...`);
-    const response = await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
     await new Promise(r => setTimeout(r, 3000)); // let JS settle
 
     const title = await page.title();
