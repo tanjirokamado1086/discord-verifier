@@ -188,3 +188,15 @@ app.get('/verify', async (req, res) => {
 app.get('/', (_, res) => res.send('Discord verifier is running.'));
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
+// ─── Global Error Handlers (Prevents the site from crashing) ───────────────
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('🚨 CRITICAL: Unhandled Promise Rejection. The site is still running.', reason);
+  // The server stays alive instead of crashing!
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('🚨 CRITICAL: Uncaught Exception. The site is still running.', err);
+  // The server stays alive instead of crashing!
+});
