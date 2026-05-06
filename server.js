@@ -15,7 +15,6 @@ const IMAP_HOST    = process.env.IMAP_HOST || 'imap.gmail.com';
 
 function extractVerifyLink(html, text) {
   if (html) {
-    // Strategy 1: find <a> whose visible text says "verify / authorize / confirm"
     const anchorRegex = /<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
     let match;
     while ((match = anchorRegex.exec(html)) !== null) {
@@ -30,7 +29,6 @@ function extractVerifyLink(html, text) {
       }
     }
 
-    // Strategy 2: href close to "verify" in the HTML
     const ctx1 = /verify[\s\S]{0,300}?href=["']([^"']*discord\.com[^"']+)["']/gi.exec(html);
     if (ctx1) { console.log(`Found by forward context: ${ctx1[1]}`); return ctx1[1]; }
 
@@ -38,7 +36,6 @@ function extractVerifyLink(html, text) {
     if (ctx2) { console.log(`Found by reverse context: ${ctx2[1]}`); return ctx2[1]; }
   }
 
-  // Strategy 3: plain text fallback
   if (text) {
     const m = text.match(/https:\/\/click\.discord\.com\/[^\s]+/);
     if (m) { console.log(`Found link from plain text: ${m[0]}`); return m[0]; }
@@ -72,8 +69,6 @@ async function getVerifyLink() {
   }
 
   try {
-    // Search only emails from last 10 minutes — avoids sorting entirely
-    // and guarantees we only act on a fresh verification email
     const since = new Date(Date.now() - 10 * 60 * 1000);
 
     let messages = await client.search({ from: '@discord.com', since }, { uid: true });
@@ -85,8 +80,6 @@ async function getVerifyLink() {
       return null;
     }
 
-    // With a 10-min window there will only ever be 1-2 emails max.
-    // UIDs within such a narrow window ARE in order, so just take the last one.
     const latestId = messages[messages.length - 1];
     console.log(`Found ${messages.length} recent Discord email(s). Using UID: ${latestId}`);
 
@@ -125,15 +118,37 @@ async function clickWithBrowser(url) {
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-gpu',
-      '--single-process',          // Fixes thread/process limits on Railway
-      '--no-zygote',               // Saves memory by not forking
-      '--disable-crash-reporter',  // Stops the crashpad_handler that caused Error 11
+      '--single-process',          
+      '--no-zygote',               
+      '--disable-crash-reporter',  
       '--disable-extensions',
       '--no-first-run'
     ],
   });
-  
-  // ... rest of your code stays exactly the same
+
+  try {
+    const page = await browser.newPage();
+    await page.setUserAgent(
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+      '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    );
+
+    console.log('Navigating to verify link...');
+
+    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+
+    await new Promise(r => setTimeout(r, 3000));
+
+    const title    = await page.title();
+    const finalUrl = page.url();
+    console.log(`Final URL : ${finalUrl}`);
+    console.log(`Page title: ${title}`);
+
+    return { status: response.status(), title, finalUrl };
+  } finally {
+    await browser.close();
+  }
+}
 
 // ─── Route ─────────────────────────────────────────────────────────────────
 
