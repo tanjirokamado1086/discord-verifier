@@ -125,35 +125,15 @@ async function clickWithBrowser(url) {
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-gpu',
+      '--single-process',          // Fixes thread/process limits on Railway
+      '--no-zygote',               // Saves memory by not forking
+      '--disable-crash-reporter',  // Stops the crashpad_handler that caused Error 11
+      '--disable-extensions',
+      '--no-first-run'
     ],
   });
-
-  try {
-    const page = await browser.newPage();
-    await page.setUserAgent(
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-      '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    );
-
-    console.log('Navigating to verify link...');
-
-    // domcontentloaded — don't wait for networkidle2 as Discord keeps
-    // background connections open and would always time out
-    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
-
-    // Give JS a moment to complete the auth handshake
-    await new Promise(r => setTimeout(r, 3000));
-
-    const title    = await page.title();
-    const finalUrl = page.url();
-    console.log(`Final URL : ${finalUrl}`);
-    console.log(`Page title: ${title}`);
-
-    return { status: response.status(), title, finalUrl };
-  } finally {
-    await browser.close();
-  }
-}
+  
+  // ... rest of your code stays exactly the same
 
 // ─── Route ─────────────────────────────────────────────────────────────────
 
