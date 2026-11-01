@@ -1,9 +1,7 @@
 name: Discord Auto Verifier
 
 on:
-  # 1. Allows triggering via cron-job.org API or manual click in GitHub UI
   workflow_dispatch:
-  # 2. Built-in GitHub schedule backup
   schedule:
     - cron: '*/5 * * * *'
 
@@ -13,17 +11,17 @@ concurrency:
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 3
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: '22'
+          node-version: '24'
           cache: 'npm'
 
       - name: Install dependencies (Skip Chrome download, use pre-installed Chrome)
