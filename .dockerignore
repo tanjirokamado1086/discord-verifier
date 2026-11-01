@@ -1,0 +1,6 @@
+node_modules
+.env
+.git
+.gitignore
+repomix-output*.xml
+npm-debug.log
