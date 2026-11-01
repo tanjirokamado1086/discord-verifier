@@ -1,22 +1,13 @@
-const express = require('express');
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
 const puppeteer = require('puppeteer');
 
-const app = express();
-const PORT = process.env.PORT || 3000;
-
 const EMAIL        = process.env.EMAIL_USER;
 const APP_PASSWORD = process.env.EMAIL_PASS;
-const CRON_SECRET  = process.env.CRON_SECRET;
 const IMAP_HOST    = process.env.IMAP_HOST || 'imap.gmail.com';
 const IMAP_PORT    = Number(process.env.IMAP_PORT) || 993;
 
-// State tracking to prevent duplicate clicks and overlapping Chrome instances
-let lastProcessedUid = null;
-let isRunning = false;
-
-// ─── Link extractor ────────────────────────────────────────────────────────
+// ─── Link Extractor ────────────────────────────────────────────────────────
 
 function extractVerifyLink(html, text) {
   if (html) {
@@ -60,18 +51,64 @@ function extractVerifyLink(html, text) {
   return null;
 }
 
-// ─── IMAP ──────────────────────────────────────────────────────────────────
+// ─── Browser Clicker ───────────────────────────────────────────────────────
 
-async function getVerifyLink() {
+async function clickWithBrowser(url) {
+  console.log('Launching Chrome on GitHub runner...');
+  const browser = await puppeteer.launch({
+    headless: true,
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || puppeteer.executablePath(),
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--no-first-run',
+    ],
+  });
+
+  try {
+    const page = await browser.newPage();
+    await page.setUserAgent(
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+      '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+    );
+
+    console.log('Navigating to Discord verification link...');
+    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+
+    // Allow Discord's frontend JS to complete the IP/location authorization handshake
+    await new Promise(r => setTimeout(r, 4000));
+
+    const title    = await page.title();
+    const finalUrl = page.url();
+    console.log(`Final URL : ${finalUrl}`);
+    console.log(`Page title: ${title}`);
+
+    return { status: response ? response.status() : 0, title, finalUrl };
+  } finally {
+    await browser.close();
+  }
+}
+
+// ─── Main IMAP + Verification Flow ─────────────────────────────────────────
+
+async function runVerifier() {
+  if (!EMAIL || !APP_PASSWORD) {
+    throw new Error('Missing EMAIL_USER or EMAIL_PASS environment variables.');
+  }
+
+  console.log(`[${new Date().toISOString()}] Starting Discord verification check...`);
+
   const client = new ImapFlow({
     host: IMAP_HOST,
     port: IMAP_PORT,
     secure: true,
     auth: { user: EMAIL, pass: APP_PASSWORD },
     logger: false,
-    connectionTimeout: 10000,
-    greetingTimeout: 10000,
-    socketTimeout: 15000,
+    connectionTimeout: 15000,
+    greetingTimeout: 15000,
+    socketTimeout: 20000,
   });
 
   await client.connect();
@@ -88,26 +125,21 @@ async function getVerifyLink() {
   }
 
   try {
-    // IMAP 'since' searches by calendar day; we filter exact minutes after fetching
     const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
 
-    let messages = await client.search({ from: '@discord.com', since }, { uid: true });
+    // Only search UNSEEN (unread) emails from Discord so we never click the same email twice
+    let messages = await client.search({ unseen: true, from: '@discord.com', since }, { uid: true });
     if (!messages?.length) {
-      messages = await client.search({ body: 'discord.com', since }, { uid: true });
+      messages = await client.search({ unseen: true, body: 'discord.com', since }, { uid: true });
     }
+
     if (!messages?.length) {
-      console.log('No Discord emails found today.');
-      return null;
+      console.log('No unread Discord emails found today. Nothing to do.');
+      return;
     }
 
     const latestId = messages[messages.length - 1];
-    console.log(`Found ${messages.length} Discord email(s) today. Latest UID: ${latestId}`);
-
-    // Skip immediately if we already verified this exact email UID
-    if (latestId === lastProcessedUid) {
-      console.log(`UID ${latestId} was already processed earlier — skipping.`);
-      return null;
-    }
+    console.log(`Found ${messages.length} unread Discord email(s). Checking latest UID: ${latestId}`);
 
     const msg    = await client.fetchOne(latestId, { source: true }, { uid: true });
     const parsed = await simpleParser(msg.source);
@@ -118,11 +150,11 @@ async function getVerifyLink() {
     console.log(`Subject : ${parsed.subject}`);
     console.log(`Received: ${emailDate?.toISOString()} (${ageMinutes.toFixed(1)} mins ago)`);
 
-    // Strict 15-minute freshness check so old emails from earlier today are ignored
-    if (emailDate && ageMinutes > 15) {
-      console.log(`Email is ${ageMinutes.toFixed(1)} mins old (> 15 min window) — marking UID ${latestId} as seen and skipping.`);
-      lastProcessedUid = latestId;
-      return null;
+    // If the email is older than 20 minutes, mark it as read so we don't keep checking it
+    if (emailDate && ageMinutes > 20) {
+      console.log(`Email is ${ageMinutes.toFixed(1)} mins old (> 20 min window). Marking as read and skipping.`);
+      await client.messageFlagsAdd(latestId, ['\\Seen'], { uid: true });
+      return;
     }
 
     if (
@@ -130,122 +162,37 @@ async function getVerifyLink() {
       parsed.subject?.includes('Email Verification')
     ) {
       const link = extractVerifyLink(parsed.html, parsed.text);
-      if (link) {
-        return { link, uid: latestId };
+      if (!link) {
+        console.log('Could not extract verify link from email. Marking as read.');
+        await client.messageFlagsAdd(latestId, ['\\Seen'], { uid: true });
+        return;
       }
-      console.log('Could not extract link from email.');
-      lastProcessedUid = latestId;
-    } else {
-      console.log('Email is not a login verification email — skipping.');
-      lastProcessedUid = latestId;
-    }
 
-    return null;
+      console.log(`Clicking verification link: ${link}`);
+      const result = await clickWithBrowser(link);
+
+      const verified =
+        result.title.toLowerCase().includes('discord') &&
+        !result.title.toLowerCase().includes('error');
+
+      if (verified) {
+        // Mark the email as Read (\Seen) in Gmail so future 5-min runs skip it
+        await client.messageFlagsAdd(latestId, ['\\Seen'], { uid: true });
+        console.log(`✅ Login verified! Marked UID ${latestId} as Read in Gmail.`);
+      } else {
+        console.log('⚠️ Clicked link, but verification title looked uncertain. Will retry next run.');
+      }
+    } else {
+      console.log('Unread Discord email is not a login verification email — marking as read.');
+      await client.messageFlagsAdd(latestId, ['\\Seen'], { uid: true });
+    }
   } finally {
     lock.release();
     await client.logout();
   }
 }
 
-// ─── Puppeteer click ───────────────────────────────────────────────────────
-
-async function clickWithBrowser(url) {
-  console.log('Launching browser...');
-  const browser = await puppeteer.launch({
-    headless: true,
-    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || puppeteer.executablePath(),
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--single-process',
-      '--no-zygote',
-      '--disable-crash-reporter',
-      '--disable-extensions',
-      '--no-first-run',
-    ],
-  });
-
-  try {
-    const page = await browser.newPage();
-    await page.setUserAgent(
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-      '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    );
-
-    console.log('Navigating to verify link...');
-
-    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
-
-    await new Promise(r => setTimeout(r, 3000));
-
-    const title    = await page.title();
-    const finalUrl = page.url();
-    console.log(`Final URL : ${finalUrl}`);
-    console.log(`Page title: ${title}`);
-
-    return { status: response.status(), title, finalUrl };
-  } finally {
-    await browser.close();
-  }
-}
-
-// ─── Routes ────────────────────────────────────────────────────────────────
-
-app.get('/verify', async (req, res) => {
-  if (req.query.secret !== CRON_SECRET) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
-  if (isRunning) {
-    console.log('⚠️ /verify already in progress — skipping overlapping request.');
-    return res.status(200).json({ success: true, message: 'Verification already running' });
-  }
-
-  isRunning = true;
-  console.log(`\n[${new Date().toISOString()}] /verify triggered`);
-
-  try {
-    const emailData = await getVerifyLink();
-    if (!emailData) {
-      return res.status(200).json({ success: true, message: 'No new verification email found (last 15 min)' });
-    }
-
-    const { link, uid } = emailData;
-    console.log(`Clicking: ${link}`);
-    const result = await clickWithBrowser(link);
-
-    const verified =
-      result.title.toLowerCase().includes('discord') &&
-      !result.title.toLowerCase().includes('error');
-
-    if (verified) {
-      lastProcessedUid = uid;
-      console.log(`✅ Login verified! Marked UID ${uid} as completed.`);
-      return res.status(200).json({ success: true, message: 'Login verified', ...result });
-    } else {
-      console.log('⚠️ Clicked but verification uncertain — check title/URL above.');
-      return res.status(200).json({ success: false, message: 'Clicked but verification uncertain', ...result });
-    }
-  } catch (err) {
-    console.error('Error:', err);
-    return res.status(500).json({ success: false, error: err.message });
-  } finally {
-    isRunning = false;
-  }
-});
-
-app.get('/', (_, res) => res.status(200).send('Discord verifier is running.'));
-
-app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
-
-// ─── Global Error Handlers (Prevents the site from crashing) ───────────────
-
-process.on('unhandledRejection', (reason) => {
-  console.error('🚨 CRITICAL: Unhandled Promise Rejection. The site is still running.', reason);
-});
-
-process.on('uncaughtException', (err) => {
-  console.error('🚨 CRITICAL: Uncaught Exception. The site is still running.', err);
+runVerifier().catch(err => {
+  console.error('❌ Fatal Error:', err);
+  process.exit(1);
 });
